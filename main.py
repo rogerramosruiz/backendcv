@@ -1,65 +1,72 @@
-import string
-import random
 import os
 import uvicorn
 import shutil
 from typing import List
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, Form, UploadFile, WebSocket
 from fastapi.staticfiles import StaticFiles
-
 from fastapi.middleware.cors import CORSMiddleware
+from opencv import apiImage, apiVideo, livevideo
 
 
-from opencv import apiImage, apiVideo
+from utilities import randomFilename
 
-filenameSize = 10
-saveDir = 'public'
+
+publicDir = os.getenv('public_dir')
+
 app = FastAPI()
-
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*']
-)
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"])
 
-#change the rgb color of the images that should imporve the results
-# maybe change for other kind of file systmem if there is time
-app.mount("/public", StaticFiles(directory=saveDir), name="public")
+app.mount("/public", StaticFiles(directory=publicDir), name="public")
 
-def randomFilename():
-    letters = string.ascii_lowercase + string.ascii_uppercase
-    while True:
-        fileName  = ''.join(random.choice(letters) for _ in range(filenameSize))    
-        fileName = f'{saveDir}/images/{fileName}'
-        if not os.path.exists(fileName):
-            return fileName
+GPU = os.getenv('GPU', 'False').lower() == 'true'
+if GPU:
+    print('Using GPU')
+else:
+    print('Not using GPU')
+
 
 @app.get('/')
 def get():
-    return {'meesage': "Hello world"}
+    return {'meesage': "Object Detection"}
 
+@app.get('/gpu')
+def useGPU():
+    return {'gpu': GPU}
+
+@app.get('/models')
+def getModels():
+    modelsDir = 'models'
+    models = os.listdir(modelsDir)
+    return {'models': models}
 
 @app.post('/image')
-async def file(file: UploadFile):
+async def file(file: UploadFile, model: str= Form(''), confidence: float = Form(0)):
+    confidence = confidence / 100
     ext = file.filename.split('.')[-1]
     fileName = randomFilename()
     fileName = f'{fileName}.{ext}'
     with open(f'{fileName}', 'wb') as f:
         shutil.copyfileobj(file.file, f)
-    apiImage(fileName)
+    apiImage(path= fileName, model= model,confidence = confidence)
     return {'filename':fileName}
 
 @app.post('/video')
-async def file(file: UploadFile):
+async def file(file: UploadFile, model: str= Form(''), confidence: float = Form(0)):
+    confidence /= 100
     ext = file.filename.split('.')[-1]
     fileName = randomFilename()
     fileName = f'{fileName}.{ext}'
     with open(f'{fileName}', 'wb') as f:
         shutil.copyfileobj(file.file, f)
-    videoPath = apiVideo(fileName)
+    fileName1 = randomFilename()
+    videoPath = apiVideo(fileName,fileName1, model, confidence)
     return {'filename':videoPath}
-
-# process image
 
 @app.post('/uploads')
 async def file(files: List[UploadFile]):
@@ -73,6 +80,9 @@ async def file(files: List[UploadFile]):
             shutil.copyfileobj(file.file, f)
     return {'filename':savedFiles}
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await livevideo(websocket)
 
 if __name__ == '__main__':
-     uvicorn.run("main:app", host='0.0.0.0', port=8000, reload=False, debug=False)
+     uvicorn.run("main:app", host='0.0.0.0', port=8000, reload=True, debug=True)

@@ -1,31 +1,28 @@
-from statistics import mode
+from math import ceil
 import cv2 as cv
 import numpy as np
-import time
 import os
+import base64
 
-weights = 'plastic/yolov4-obj_last.weights'
-model = 'plastic/yolov4-obj.cfg'
-names = 'plastic/obj.names'
+from utilities import loadColors, getModel
 
-# yolov4
-# weights = 'yolov4/yolov4.weights'
-# model = 'yolov4/yolov4.cfg'
-# names = 'yolov4/coco.names'
+modelCfg = os.getenv('modelcfg')
 
-net = cv.dnn.readNet(weights, model)
-classes = []
-with  open(names, 'r') as f:
-    classes = [i.strip() for i in f.readlines()]
+colors, classes = loadColors()
 
-layer_names = net.getLayerNames()
-output_layers = [layer_names[i-1] for i in net.getUnconnectedOutLayers()]
-colors = np.random.uniform(0, 255, size = (len(classes), 3))
 
-def predict(img, boxsize=2):
+def createNet(model):
+    weights = getModel(model)
+    net = cv.dnn.readNet(weights, modelCfg)
+    layer_names = net.getLayerNames()
+    output_layers = [layer_names[i-1] for i in net.getUnconnectedOutLayers()]
+    return net, output_layers
+
+def predict(net, output_layers, img, confidenceTreshold):
     height, width, _ = img.shape
-    # Detecting object                                          # if it is beeing read from the image itself maybay change it to false
-    blob = cv.dnn.blobFromImage(img,0.00392, (416, 416), (0,0,0), True, crop= False)
+    boxsize = ((height + width) / 2)* 0.002
+    boxsize = ceil(boxsize)
+    blob = cv.dnn.blobFromImage(img, 0.00392, (512, 512), (0,0,0), True, crop= False)
     net.setInput(blob)
     outs = net.forward(output_layers)
     confidences = []
@@ -47,70 +44,72 @@ def predict(img, boxsize=2):
                 boxes.append([x, y, w, h])
                 confidences.append(float(confidence))
                 class_ids.append(class_id)
-    indexes = cv.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+    indexes = cv.dnn.NMSBoxes(boxes, confidences, confidenceTreshold, 0.4)
     n_obj_detected = len(indexes)
     for i in indexes:
         x, y, w, h = boxes[i]
         label = str(classes[class_ids[i]])
         color = colors[class_ids[i]]
-        cv.rectangle(img, (x,y), (x + w, y + h), color, boxsize) # 15
-        cv.putText(img, label, (x + 5, y- 10 ), cv.FONT_HERSHEY_DUPLEX, boxsize, color, boxsize) # 5
-        # cv.putText(img, str(n_obj_detected), (25, 25), cv.FONT_HERSHEY_DUPLEX, boxsize, (255,0,0)) # 5
+        cv.rectangle(img, (x,y), (x + w, y + h), color, boxsize)
+        cv.putText(img, label, (x + 5, y- 10 ), cv.FONT_HERSHEY_DUPLEX, boxsize, color, boxsize)
 
-def apiImage(path):
+def apiImage(path, model, confidence=0.5):
     img = cv.imread(path)
-    predict(img)
+    net, output_layers = createNet(model)
+    predict(net, output_layers,img,confidence)
     cv.imwrite(path, img)
 
-def image(path, factor_resize = 1):
-    img = cv.imread(path)
-    img = cv.resize(img, None, fx = factor_resize, fy = factor_resize)
-    predict(img)
-    cv.imshow('img', img )
-    cv.waitKey(0)
-
-def apiVideo(path):
+def apiVideo(path, newVideoPath, model, confidence=0.5):
     video = cv.VideoCapture(path)
     size = (int(video.get(3)), int(video.get(4)))
-    fileName = path.split('.')[0]
-    fileName = f'{fileName}.avi'
-    result = cv.VideoWriter(fileName, cv.VideoWriter_fourcc(*'MJPG'), 10, size)
+    fileName = f'{newVideoPath}.mp4'
+    print(fileName)
+    # MPV4 works but not in docker
+    # X264 with errors but works for web 
+    # H264 with errors  but works for web
+
+    net, output_layers = createNet(model)
+    result = cv.VideoWriter(fileName, cv.VideoWriter_fourcc(*'H264'), video.get(cv.CAP_PROP_FPS), size)
     while video.isOpened():
         ret, frame = video.read()
         if not ret:
              break        
-        predict(frame)
+        predict(net, output_layers, frame, confidence)
         result.write(frame)
-        if cv.waitKey(1) == ord('q'):
-            break
     video.release()
     result.release()
     os.remove(path)
     return fileName
 
-def camera():
-    cap = cv.VideoCapture(0)
-    if not cap.isOpened():
-        print("Cannot open camera")
-        exit()
-    prev_frame_time = 0
-    new_frame_time = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv.flip(frame, 1)
-        predict(frame, 2)
-        cv.imshow('frame', frame)
-        if cv.waitKey(1) == ord('q'):
-            break
-        new_frame_time = time.time() 
-        fps = 1/(new_frame_time-prev_frame_time)
-        print(int(fps))
-        prev_frame_time = new_frame_time
-    cap.release()
-    cv.destroyAllWindows()
-    
-if __name__ == '__main__':
-    camera()
-    # apiVideo("files/UNyntcWVzt.MOV")
+async def livevideo(websocket):
+    model, lastmodel = '', '';
+    net, output_layers = None, None
+    try:
+        await websocket.accept()
+        while True:
+            data = await websocket.receive_json()
+            lastmodel = model 
+            model = data['model']
+            if model != lastmodel:
+                net, output_layers = createNet(model)
+            if model == '':
+                continue
+
+            data_img = data['image']
+            confidece = float(data['confidence'])
+            confidece /= 100;
+            img_b64 = data_img[22:]
+            bin_data = base64.b64decode(img_b64)
+            image = np.asarray(bytearray(bin_data), dtype=np.uint8)
+            img = cv.imdecode(image, cv.IMREAD_COLOR)
+            img  = cv.flip(img, 1)
+            predict(net, output_layers, img, confidece)
+            img_str = cv.imencode('.jpg', img)[1].tostring()
+            jpg_as_text = base64.b64encode(img_str)
+            
+            await websocket.send_text(jpg_as_text.decode('ascii'))
+            if not data['keepconection']:
+                break
+        await websocket.close()
+    except:
+        pass
